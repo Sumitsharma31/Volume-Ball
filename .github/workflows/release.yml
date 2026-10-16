@@ -1,0 +1,45 @@
+name: Publish Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Publish Release with APK
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "Volume Ball v1.0 🕹️"
+          draft: false
+          prerelease: false
+          files: release/VolumeBall-v1.0.apk
+          body: |
+            # Volume Ball v1.0 🕹️🔊
+            **The Modern Floating Game-Joystick Solution for Android Volume Control**
+
+            ### 💡 The Lifesaver for Damaged Hardware Buttons
+            A floating, always-accessible game joystick on your screen that controls media, call, and ringtone volume with smooth thumbstick gestures — without ever touching physical volume buttons again.
+
+            ### ✨ Key Features:
+            - 🕹️ **Interactive Game Joystick**: Drag Up/Right to raise, Down/Left to lower, hold to smoothly glide volume.
+            - 📞 **Dynamic In-Call Audio Routing**: Automatically detects cellular calls, WhatsApp, Telegram, Google Meet, Zoom, and switches to Call Volume (`STREAM_VOICE_CALL`).
+            - 🛡️ **Accidental Touch Protection**: Taps and accidental brushes are ignored; only intentional joystick deflections adjust volume.
+            - 📍 **Hold-to-Reposition**: Hold for ~350ms to drag and snap the ball anywhere on your screen.
+            - 🎨 **4 Ball Styles**: Classic Joystick, Cyber Neon, Minimal Frosted Glass, Retro Arcade.
+            - ❖ **4 Inside Icon Sets**: Minimalist Geometric, Classic Volume Speakers, Cyber Gamer, Music Waves.
+            - ☕ **Buy Developer a Coffee**: Integrated direct UPI support (`ssumit20kr@ybl`).
+
+            ### 📲 Installation:
+            1. Download `VolumeBall-v1.0.apk` below.
+            2. Install the APK on your Android device (Android 6.0+).
+            3. Grant the "Display over other apps" permission when prompted and enjoy!
