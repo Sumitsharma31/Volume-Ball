@@ -19,16 +19,19 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          name: "Volume Ball v1.0 🕹️"
+          name: "Volume Ball ${{ github.ref_name }} 🕹️"
           draft: false
           prerelease: false
-          files: release/VolumeBall-v1.0.apk
+          files: release/*.apk
           body: |
-            # Volume Ball v1.0 🕹️🔊
+            # Volume Ball ${{ github.ref_name }} 🕹️🔊
             **The Modern Floating Game-Joystick Solution for Android Volume Control**
 
-            ### 💡 The Lifesaver for Damaged Hardware Buttons
-            A floating, always-accessible game joystick on your screen that controls media, call, and ringtone volume with smooth thumbstick gestures — without ever touching physical volume buttons again.
+            ### 🚀 What's New in This Release:
+            - ⏱️ **Drag Drop Actions**: Long-press and drag the joystick to reveal bottom action targets — **"Hide 1m"** (temporarily pauses joystick for 60 seconds) and **"Stop Ball"** (safely shuts down floating overlay).
+            - 🎨 **Redesigned Compact Drop Targets**: Minimal circular badges (56dp) with gentle micro-scaling (1.06x) and glowing borders.
+            - 💰 **Google AdMob Integration**: Adaptive anchored banner support and full-screen interstitial flow on launch.
+            - 🔄 **Real-Time Button Sync**: Main UI automatically synchronizes state immediately whenever the joystick is stopped from screen overlay or notification.
 
             ### ✨ Key Features:
             - 🕹️ **Interactive Game Joystick**: Drag Up/Right to raise, Down/Left to lower, hold to smoothly glide volume.
@@ -40,6 +43,6 @@ jobs:
             - ☕ **Buy Developer a Coffee**: Integrated direct UPI support (`ssumit20kr@ybl`).
 
             ### 📲 Installation:
-            1. Download `VolumeBall-v1.0.apk` below.
+            1. Download the APK attached below.
             2. Install the APK on your Android device (Android 6.0+).
             3. Grant the "Display over other apps" permission when prompted and enjoy!
