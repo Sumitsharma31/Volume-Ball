@@ -10,16 +10,29 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
+import android.util.Log
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowInsets
 import android.widget.Button
+import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
+import com.google.android.gms.ads.AdError
+import com.google.android.gms.ads.AdListener
+import com.google.android.gms.ads.AdRequest
+import com.google.android.gms.ads.AdSize
+import com.google.android.gms.ads.AdView
+import com.google.android.gms.ads.FullScreenContentCallback
+import com.google.android.gms.ads.LoadAdError
+import com.google.android.gms.ads.MobileAds
+import com.google.android.gms.ads.interstitial.InterstitialAd
+import com.google.android.gms.ads.interstitial.InterstitialAdLoadCallback
 
 class MainActivity : Activity() {
 
@@ -28,6 +41,14 @@ class MainActivity : Activity() {
     private lateinit var opacityLabel: TextView
     private lateinit var sizeLabel: TextView
     private var permissionRequestInProgress = false
+
+    // AdMob components
+    private var adView: AdView? = null
+    private var interstitialAd: InterstitialAd? = null
+    private var isInterstitialLoading = false
+    private var isAdShowing = false
+    private var pendingStartAfterAdLoad = false
+
 
     // Color choices
     private val themeColors = listOf(
@@ -571,18 +592,87 @@ class MainActivity : Activity() {
             bottomMargin = dp(28)
         })
 
-        setContentView(scrollView)
+        val mainContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(pageBg)
+            layoutParams = ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
+        }
+
+        // Scrollable content takes all available vertical space above banner
+        mainContainer.addView(scrollView, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            0,
+            1f
+        ))
+
+        // Adaptive banner ad container confined strictly to bottom of app UI
+        val bannerContainer = FrameLayout(this).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                gravity = Gravity.CENTER_HORIZONTAL
+            }
+            visibility = View.GONE // Remained hidden until an ad successfully loads
+        }
+        mainContainer.addView(bannerContainer)
+
+        setContentView(mainContainer)
         applyWindowColors(pageBg, isDark)
         refreshUi()
+
+        FloatingBallService.onRunningStateChanged = {
+            runOnUiThread {
+                refreshUi()
+            }
+        }
+
+        // Asynchronously initialize Google Mobile Ads SDK without blocking UI
+        MobileAds.initialize(this) {
+            runOnUiThread {
+                loadAdaptiveBanner(bannerContainer)
+                preloadInterstitial()
+            }
+        }
     }
 
     override fun onResume() {
         super.onResume()
+        try {
+            adView?.resume()
+        } catch (_: Exception) {}
         refreshUi()
+        if (FloatingBallService.isRunning) {
+            // Restore ball if it was temporarily hidden
+            val restoreIntent = Intent(this, FloatingBallService::class.java).apply {
+                action = FloatingBallService.ACTION_RESTORE
+            }
+            startService(restoreIntent)
+        }
         if (permissionRequestInProgress && Settings.canDrawOverlays(this)) {
             permissionRequestInProgress = false
             startOverlay()
         }
+    }
+
+    override fun onPause() {
+        try {
+            adView?.pause()
+        } catch (_: Exception) {}
+        super.onPause()
+    }
+
+    override fun onDestroy() {
+        FloatingBallService.onRunningStateChanged = null
+        try {
+            adView?.destroy()
+            adView = null
+        } catch (_: Exception) {}
+        interstitialAd = null
+        super.onDestroy()
     }
 
     private fun notifyServiceConfigChanged() {
@@ -607,7 +697,59 @@ class MainActivity : Activity() {
             )
             return
         }
-        startOverlay()
+
+        if (ENABLE_START_INTERSTITIAL) {
+            if (interstitialAd != null && !isAdShowing) {
+                showInterstitialAndStart()
+            } else if (isInterstitialLoading) {
+                Toast.makeText(this, "Starting volume joystick...", Toast.LENGTH_SHORT).show()
+                pendingStartAfterAdLoad = true
+                startButton.isEnabled = false
+                startButton.postDelayed({
+                    if (pendingStartAfterAdLoad) {
+                        pendingStartAfterAdLoad = false
+                        startButton.isEnabled = true
+                        startOverlay()
+                    }
+                }, 2000)
+            } else {
+                startOverlay()
+                preloadInterstitial()
+            }
+        } else {
+            startOverlay()
+        }
+    }
+
+    private fun showInterstitialAndStart() {
+        val ad = interstitialAd
+        if (ad == null || isAdShowing) {
+            startOverlay()
+            return
+        }
+
+        isAdShowing = true
+        ad.fullScreenContentCallback = object : FullScreenContentCallback() {
+            override fun onAdDismissedFullScreenContent() {
+                isAdShowing = false
+                interstitialAd = null
+                startOverlay()
+                preloadInterstitial()
+            }
+
+            override fun onAdFailedToShowFullScreenContent(adError: AdError) {
+                Log.w("MainActivity", "Interstitial failed to show: ${adError.message}")
+                isAdShowing = false
+                interstitialAd = null
+                startOverlay()
+                preloadInterstitial()
+            }
+
+            override fun onAdShowedFullScreenContent() {
+                interstitialAd = null
+            }
+        }
+        ad.show(this)
     }
 
     private fun startOverlay() {
@@ -695,4 +837,136 @@ class MainActivity : Activity() {
 
     private fun dp(value: Int) = (value * resources.displayMetrics.density + 0.5f).toInt()
     private fun dp(value: Float) = (value * resources.displayMetrics.density + 0.5f).toInt()
+
+    // ---------------------------------------------------------------------------
+    // Google AdMob Monetization Methods
+    // ---------------------------------------------------------------------------
+
+    private fun loadAdaptiveBanner(container: FrameLayout) {
+        try {
+            val banner = AdView(this).apply {
+                adUnitId = BANNER_AD_UNIT_ID
+                setAdSize(getAdaptiveBannerAdSize())
+                adListener = object : AdListener() {
+                    override fun onAdLoaded() {
+                        container.visibility = View.VISIBLE
+                    }
+
+                    override fun onAdFailedToLoad(loadAdError: LoadAdError) {
+                        Log.w("MainActivity", "Banner ad failed to load: ${loadAdError.message} (code ${loadAdError.code})")
+                        // If user provided an Ad Unit created for another format (e.g. Interstitial),
+                        // fall back to Google's official test banner so the user can verify the banner layout immediately.
+                        if (loadAdError.message.contains("match format", ignoreCase = true) && adUnitId != TEST_BANNER_AD_UNIT_ID) {
+                            Log.i("MainActivity", "Format mismatch detected. Falling back to test banner ID...")
+                            post {
+                                try {
+                                    container.removeAllViews()
+                                    val fallbackBanner = AdView(this@MainActivity).apply {
+                                        adUnitId = TEST_BANNER_AD_UNIT_ID
+                                        setAdSize(getAdaptiveBannerAdSize())
+                                        adListener = object : AdListener() {
+                                            override fun onAdLoaded() {
+                                                container.visibility = View.VISIBLE
+                                            }
+                                            override fun onAdFailedToLoad(err: LoadAdError) {
+                                                container.visibility = View.GONE
+                                            }
+                                        }
+                                    }
+                                    this@MainActivity.adView = fallbackBanner
+                                    container.addView(fallbackBanner)
+                                    fallbackBanner.loadAd(AdRequest.Builder().build())
+                                } catch (_: Exception) {
+                                    container.visibility = View.GONE
+                                }
+                            }
+                        } else {
+                            container.visibility = View.GONE
+                        }
+                    }
+                }
+            }
+            this.adView = banner
+            container.removeAllViews()
+            container.addView(banner)
+
+            val adRequest = AdRequest.Builder().build()
+            banner.loadAd(adRequest)
+        } catch (e: Exception) {
+            Log.e("MainActivity", "Error initializing banner ad", e)
+            container.visibility = View.GONE
+        }
+    }
+
+    private fun getAdaptiveBannerAdSize(): AdSize {
+        return try {
+            val displayMetrics = resources.displayMetrics
+            val adWidthPixels = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                val windowMetrics = windowManager.currentWindowMetrics
+                val insets = windowMetrics.windowInsets.getInsetsIgnoringVisibility(
+                    WindowInsets.Type.systemBars()
+                )
+                windowMetrics.bounds.width() - insets.left - insets.right
+            } else {
+                displayMetrics.widthPixels
+            }
+            val density = displayMetrics.density
+            val adWidth = if (density > 0) (adWidthPixels / density).toInt() else 320
+            AdSize.getCurrentOrientationAnchoredAdaptiveBannerAdSize(this, adWidth)
+        } catch (_: Exception) {
+            AdSize.BANNER
+        }
+    }
+
+    private fun preloadInterstitial(adUnit: String = INTERSTITIAL_AD_UNIT_ID) {
+        if (interstitialAd != null || isInterstitialLoading) return
+        isInterstitialLoading = true
+
+        val adRequest = AdRequest.Builder().build()
+        InterstitialAd.load(
+            this,
+            adUnit,
+            adRequest,
+            object : InterstitialAdLoadCallback() {
+                override fun onAdLoaded(ad: InterstitialAd) {
+                    interstitialAd = ad
+                    isInterstitialLoading = false
+                    Log.i("MainActivity", "Interstitial ad loaded successfully with unit: $adUnit")
+                    if (pendingStartAfterAdLoad) {
+                        pendingStartAfterAdLoad = false
+                        startButton.isEnabled = true
+                        showInterstitialAndStart()
+                    }
+                }
+
+                override fun onAdFailedToLoad(loadAdError: LoadAdError) {
+                    Log.w("MainActivity", "Interstitial ad ($adUnit) failed to load: ${loadAdError.message}")
+                    interstitialAd = null
+                    isInterstitialLoading = false
+                    if (adUnit != TEST_INTERSTITIAL_AD_UNIT_ID) {
+                        Log.i("MainActivity", "Falling back to Google test interstitial unit...")
+                        preloadInterstitial(TEST_INTERSTITIAL_AD_UNIT_ID)
+                    } else if (pendingStartAfterAdLoad) {
+                        pendingStartAfterAdLoad = false
+                        startButton.isEnabled = true
+                        startOverlay()
+                    }
+                }
+            }
+        )
+    }
+
+    companion object {
+        // Official Google Test Ad Unit IDs
+        private const val TEST_BANNER_AD_UNIT_ID = "ca-app-pub-3940256099942544/6300978111"
+        private const val TEST_INTERSTITIAL_AD_UNIT_ID = "ca-app-pub-3940256099942544/1033173712"
+
+        // Production Ad Unit IDs
+        // Note: ca-app-pub-3407443667160242/9689967302 was created as an Interstitial in AdMob Console
+        private const val BANNER_AD_UNIT_ID = "ca-app-pub-3407443667160242/9689967302"
+        private const val INTERSTITIAL_AD_UNIT_ID = "ca-app-pub-3407443667160242/9689967302"
+
+        private const val ENABLE_START_INTERSTITIAL = true
+    }
 }
+

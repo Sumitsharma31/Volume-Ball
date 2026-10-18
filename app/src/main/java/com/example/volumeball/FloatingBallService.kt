@@ -17,10 +17,15 @@ import android.graphics.DashPathEffect
 import android.graphics.Paint
 import android.graphics.PixelFormat
 import android.graphics.RadialGradient
+import android.graphics.Rect
 import android.graphics.Shader
 import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.Icon
 import android.media.AudioManager
+import android.widget.LinearLayout
+import android.widget.TextView
+import android.widget.Toast
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -49,6 +54,20 @@ class FloatingBallService : Service() {
     private var joystickView: JoystickBallView? = null
     private var joystickParams: WindowManager.LayoutParams? = null
 
+    // Drop target overlay (Hide 1m / Stop Ball)
+    private var dropTargetView: DropTargetContainer? = null
+
+    // 1-minute temporary hide
+    private var isTemporarilyHidden = false
+    private val unhideHandler = Handler(Looper.getMainLooper())
+    private val unhideRunnable = Runnable {
+        isTemporarilyHidden = false
+        if (Settings.canDrawOverlays(this@FloatingBallService) && isRunning) {
+            showJoystick()
+            updateNotification()
+        }
+    }
+
     // Volume observers
     private val volumeObserver = object : ContentObserver(Handler(Looper.getMainLooper())) {
         override fun onChange(selfChange: Boolean) {
@@ -70,6 +89,7 @@ class FloatingBallService : Service() {
     override fun onCreate() {
         super.onCreate()
         isRunning = true
+        onRunningStateChanged?.invoke(true)
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
         createNotificationChannel()
@@ -99,11 +119,14 @@ class FloatingBallService : Service() {
         when (intent?.action) {
             ACTION_STOP -> stopSelf()
             ACTION_UPDATE_CONFIG -> applyConfig()
+            ACTION_RESTORE -> cancelTemporaryHide()
         }
         return START_NOT_STICKY
     }
 
     override fun onDestroy() {
+        unhideHandler.removeCallbacks(unhideRunnable)
+        removeDropTargetView()
         try {
             contentResolver.unregisterContentObserver(volumeObserver)
         } catch (_: Exception) {}
@@ -115,6 +138,7 @@ class FloatingBallService : Service() {
             removeJoystick()
         } finally {
             isRunning = false
+            onRunningStateChanged?.invoke(false)
         }
         super.onDestroy()
     }
@@ -126,7 +150,7 @@ class FloatingBallService : Service() {
     // ---------------------------------------------------------------------------
 
     private fun showJoystick() {
-        if (joystickView != null || !Settings.canDrawOverlays(this)) return
+        if (joystickView != null || !Settings.canDrawOverlays(this) || isTemporarilyHidden) return
         val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
         val sizeDp = prefs.getInt(KEY_SIZE, DEFAULT_SIZE_DP).coerceIn(48, 88)
         val sizePx = dp(sizeDp)
@@ -166,12 +190,127 @@ class FloatingBallService : Service() {
             onTouchStart = {
                 updateJoystickVolume()
             }
+            onDragModeChanged = { isDragging ->
+                if (isDragging) {
+                    showDropTargetView()
+                } else {
+                    removeDropTargetView()
+                }
+            }
+            onDragPositionMoved = { rawX, rawY ->
+                dropTargetView?.updateHover(rawX, rawY)
+            }
+            onDragRelease = { rawX, rawY ->
+                handleDropRelease(rawX, rawY)
+            }
         }
 
         joystickView = joystick
         joystickParams = params
         updateJoystickVolume()
         windowManager.addView(joystick, params)
+    }
+
+    private fun showDropTargetView() {
+        if (dropTargetView != null || !Settings.canDrawOverlays(this)) return
+        val target = DropTargetContainer(this).apply {
+            alpha = 0f
+            translationY = dp(40).toFloat()
+        }
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+            else
+                @Suppress("DEPRECATION")
+                WindowManager.LayoutParams.TYPE_PHONE,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+            y = dp(32)
+        }
+
+        try {
+            windowManager.addView(target, params)
+            dropTargetView = target
+            target.animate()
+                .alpha(1f)
+                .translationY(0f)
+                .setDuration(180)
+                .start()
+        } catch (_: Exception) {}
+    }
+
+    private fun removeDropTargetView() {
+        val target = dropTargetView ?: return
+        dropTargetView = null
+        try {
+            target.animate()
+                .alpha(0f)
+                .translationY(dp(30).toFloat())
+                .setDuration(140)
+                .withEndAction {
+                    try {
+                        windowManager.removeView(target)
+                    } catch (_: Exception) {}
+                }
+                .start()
+        } catch (_: Exception) {
+            try {
+                windowManager.removeView(target)
+            } catch (_: Exception) {}
+        }
+    }
+
+    private fun handleDropRelease(rawX: Float, rawY: Float): Boolean {
+        val target = dropTargetView ?: return false
+        val action = target.updateHover(rawX, rawY)
+        removeDropTargetView()
+        return when (action) {
+            1 -> {
+                hideJoystickForOneMinute()
+                true
+            }
+            2 -> {
+                isRunning = false
+                onRunningStateChanged?.invoke(false)
+                Toast.makeText(this, "Volume Joystick stopped", Toast.LENGTH_SHORT).show()
+                stopSelf()
+                true
+            }
+            else -> false
+        }
+    }
+
+    private fun hideJoystickForOneMinute() {
+        unhideHandler.removeCallbacks(unhideRunnable)
+        isTemporarilyHidden = true
+        removeJoystick()
+        updateNotification()
+        Toast.makeText(this, "Volume Joystick hidden for 1 minute", Toast.LENGTH_SHORT).show()
+        unhideHandler.postDelayed(unhideRunnable, 60_000L)
+    }
+
+    private fun cancelTemporaryHide() {
+        if (isTemporarilyHidden) {
+            unhideHandler.removeCallbacks(unhideRunnable)
+            isTemporarilyHidden = false
+            if (Settings.canDrawOverlays(this) && isRunning) {
+                showJoystick()
+                updateNotification()
+            }
+        }
+    }
+
+    private fun updateNotification() {
+        try {
+            val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+            nm.notify(NOTIFICATION_ID, buildNotification())
+        } catch (_: Exception) {}
     }
 
     private fun applyConfig() {
@@ -281,32 +420,59 @@ class FloatingBallService : Service() {
             Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
+        val restoreIntent = PendingIntent.getService(
+            this, 3,
+            Intent(this, FloatingBallService::class.java).setAction(ACTION_RESTORE),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val title = if (isTemporarilyHidden) "Volume Joystick Paused (1 min)" else "Volume Joystick Active"
+        val desc = if (isTemporarilyHidden)
+            "Joystick is hidden for 1 min. Tap to restore immediately."
+        else
+            "Drag joystick Up/Right to raise, Down/Left to lower volume. Hold to reposition."
 
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            Notification.Builder(this, CHANNEL_ID)
-                .setContentTitle("Volume Joystick Active")
-                .setContentText("Drag joystick Up/Right to raise, Down/Left to lower volume. Hold to reposition.")
+            val builder = Notification.Builder(this, CHANNEL_ID)
+                .setContentTitle(title)
+                .setContentText(desc)
                 .setSmallIcon(android.R.drawable.ic_lock_silent_mode_off)
-                .setContentIntent(appIntent)
-                .addAction(
+                .setContentIntent(if (isTemporarilyHidden) restoreIntent else appIntent)
+                .setOngoing(true)
+
+            if (isTemporarilyHidden) {
+                builder.addAction(
+                    Notification.Action.Builder(
+                        Icon.createWithResource(this, android.R.drawable.ic_menu_revert),
+                        "Restore Now",
+                        restoreIntent
+                    ).build()
+                )
+            } else {
+                builder.addAction(
                     Notification.Action.Builder(
                         Icon.createWithResource(this, android.R.drawable.ic_menu_close_clear_cancel),
                         "Stop",
                         stopIntent
                     ).build()
                 )
-                .setOngoing(true)
-                .build()
+            }
+            builder.build()
         } else {
             @Suppress("DEPRECATION")
-            Notification.Builder(this)
-                .setContentTitle("Volume Joystick Active")
-                .setContentText("Drag joystick Up/Right to raise, Down/Left to lower volume. Hold to reposition.")
+            val builder = Notification.Builder(this)
+                .setContentTitle(title)
+                .setContentText(desc)
                 .setSmallIcon(android.R.drawable.ic_lock_silent_mode_off)
-                .setContentIntent(appIntent)
-                .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Stop", stopIntent)
+                .setContentIntent(if (isTemporarilyHidden) restoreIntent else appIntent)
                 .setOngoing(true)
-                .build()
+
+            if (isTemporarilyHidden) {
+                builder.addAction(android.R.drawable.ic_menu_revert, "Restore Now", restoreIntent)
+            } else {
+                builder.addAction(android.R.drawable.ic_menu_close_clear_cancel, "Stop", stopIntent)
+            }
+            builder.build()
         }
     }
 
@@ -356,13 +522,16 @@ class FloatingBallService : Service() {
 
         const val ACTION_STOP = "com.example.volumeball.STOP"
         const val ACTION_UPDATE_CONFIG = "com.example.volumeball.UPDATE_CONFIG"
+        const val ACTION_RESTORE = "com.example.volumeball.RESTORE"
 
         private const val CHANNEL_ID = "floating_volume_control"
         private const val NOTIFICATION_ID = 1001
 
         @Volatile
         var isRunning: Boolean = false
-            private set
+            internal set
+
+        var onRunningStateChanged: ((Boolean) -> Unit)? = null
     }
 }
 
@@ -392,6 +561,9 @@ private class JoystickBallView(context: Context) : View(context) {
     var onPositionChanged: ((Int, Int) -> Unit)? = null
     var onPositionSave: ((Int, Int) -> Unit)? = null
     var onTouchStart: (() -> Unit)? = null
+    var onDragModeChanged: ((Boolean) -> Unit)? = null
+    var onDragPositionMoved: ((Float, Float) -> Unit)? = null
+    var onDragRelease: ((Float, Float) -> Boolean)? = null
 
     // Volume state
     private var currentVolume = 0
@@ -435,6 +607,7 @@ private class JoystickBallView(context: Context) : View(context) {
             knobX = 0f
             knobY = 0f
             invalidate()
+            onDragModeChanged?.invoke(true)
         }
     }
 
@@ -720,6 +893,7 @@ private class JoystickBallView(context: Context) : View(context) {
                     val newX = (windowStartX + dx.toInt()).coerceIn(0, max(0, screenW - width))
                     val newY = (windowStartY + dy.toInt()).coerceIn(0, max(0, screenH - height))
                     onPositionChanged?.invoke(newX, newY)
+                    onDragPositionMoved?.invoke(event.rawX, event.rawY)
                 } else {
                     // Joystick deflection logic
                     val maxTravel = (width * 0.25f)
@@ -781,11 +955,19 @@ private class JoystickBallView(context: Context) : View(context) {
 
                 if (isDraggingPosition) {
                     isDraggingPosition = false
-                    val screenW = resources.displayMetrics.widthPixels
-                    val snapX = if (event.rawX > screenW / 2f) screenW - width - dp(8) else dp(8)
-                    val snapY = (windowStartY + (event.rawY - downRawY).toInt()).coerceIn(0, resources.displayMetrics.heightPixels - height)
-                    onPositionChanged?.invoke(snapX, snapY)
-                    onPositionSave?.invoke(snapX, snapY)
+                    val handled = if (event.action == MotionEvent.ACTION_UP) {
+                        onDragRelease?.invoke(event.rawX, event.rawY) ?: false
+                    } else {
+                        onDragModeChanged?.invoke(false)
+                        false
+                    }
+                    if (!handled) {
+                        val screenW = resources.displayMetrics.widthPixels
+                        val snapX = if (event.rawX > screenW / 2f) screenW - width - dp(8) else dp(8)
+                        val snapY = (windowStartY + (event.rawY - downRawY).toInt()).coerceIn(0, resources.displayMetrics.heightPixels - height)
+                        onPositionChanged?.invoke(snapX, snapY)
+                        onPositionSave?.invoke(snapX, snapY)
+                    }
                     invalidate()
                 } else {
                     animateKnobReturn()
@@ -821,3 +1003,178 @@ private class JoystickBallView(context: Context) : View(context) {
     private fun dp(value: Float) = (value * resources.displayMetrics.density + 0.5f).toInt()
     private fun dp(value: Int) = (value * resources.displayMetrics.density + 0.5f).toInt()
 }
+
+// ---------------------------------------------------------------------------
+// DropTargetContainer: Bottom targets for Hide (1 min) & Stop Ball
+// ---------------------------------------------------------------------------
+
+private class DropTargetContainer(context: Context) : LinearLayout(context) {
+
+    private val targetHide: LinearLayout
+    private val targetStop: LinearLayout
+    private var currentHovered = 0 // 0: None, 1: Hide, 2: Stop
+
+    init {
+        orientation = HORIZONTAL
+        gravity = Gravity.CENTER
+        setPadding(dp(16), dp(8), dp(16), dp(12))
+
+        fun createCardBg(fillColor: Int, strokeColor: Int, radiusDp: Int, strokeWidthDp: Float = 1.2f): GradientDrawable {
+            return GradientDrawable().apply {
+                setColor(fillColor)
+                cornerRadius = radiusDp * resources.displayMetrics.density + 0.5f
+                setStroke((strokeWidthDp * resources.displayMetrics.density + 0.5f).toInt(), strokeColor)
+            }
+        }
+
+        val cardSize = dp(56)
+        val radius = 28
+
+        // Target 1: Hide for 1 minute
+        targetHide = LinearLayout(context).apply {
+            orientation = VERTICAL
+            gravity = Gravity.CENTER
+            layoutParams = LayoutParams(cardSize, cardSize).apply {
+                rightMargin = dp(16)
+            }
+            background = createCardBg(
+                Color.argb(235, 24, 24, 34),
+                Color.argb(160, 90, 90, 130),
+                radius
+            )
+
+            addView(TextView(context).apply {
+                text = "⏱️"
+                textSize = 16f
+                gravity = Gravity.CENTER
+            })
+            addView(TextView(context).apply {
+                text = "Hide 1m"
+                textSize = 9f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(Color.rgb(215, 215, 230))
+                gravity = Gravity.CENTER
+            })
+        }
+
+        // Target 2: Stop / Remove ball
+        targetStop = LinearLayout(context).apply {
+            orientation = VERTICAL
+            gravity = Gravity.CENTER
+            layoutParams = LayoutParams(cardSize, cardSize).apply {
+                leftMargin = dp(16)
+            }
+            background = createCardBg(
+                Color.argb(235, 38, 20, 26),
+                Color.argb(180, 210, 40, 60),
+                radius
+            )
+
+            addView(TextView(context).apply {
+                text = "✕"
+                textSize = 16f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(Color.rgb(255, 68, 68))
+                gravity = Gravity.CENTER
+            })
+            addView(TextView(context).apply {
+                text = "Stop Ball"
+                textSize = 9f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(Color.rgb(255, 140, 140))
+                gravity = Gravity.CENTER
+            })
+        }
+
+        addView(targetHide)
+        addView(targetStop)
+    }
+
+    fun updateHover(rawX: Float, rawY: Float): Int {
+        val locHide = IntArray(2)
+        val locStop = IntArray(2)
+        targetHide.getLocationOnScreen(locHide)
+        targetStop.getLocationOnScreen(locStop)
+
+        val slop = dp(22)
+        val rHide = Rect(
+            locHide[0] - slop,
+            locHide[1] - slop,
+            locHide[0] + targetHide.width + slop,
+            locHide[1] + targetHide.height + slop
+        )
+        val rStop = Rect(
+            locStop[0] - slop,
+            locStop[1] - slop,
+            locStop[0] + targetStop.width + slop,
+            locStop[1] + targetStop.height + slop
+        )
+
+        val hover = when {
+            rHide.contains(rawX.toInt(), rawY.toInt()) -> 1
+            rStop.contains(rawX.toInt(), rawY.toInt()) -> 2
+            else -> 0
+        }
+
+        if (hover != currentHovered) {
+            currentHovered = hover
+            applyHoverStyles(hover)
+            if (hover != 0) {
+                performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+            }
+        }
+        return hover
+    }
+
+    private fun applyHoverStyles(hover: Int) {
+        fun createCardBg(fillColor: Int, strokeColor: Int, radiusDp: Int, strokeWidthDp: Float): GradientDrawable {
+            return GradientDrawable().apply {
+                setColor(fillColor)
+                cornerRadius = radiusDp * resources.displayMetrics.density + 0.5f
+                setStroke((strokeWidthDp * resources.displayMetrics.density + 0.5f).toInt(), strokeColor)
+            }
+        }
+
+        val radius = 28
+        val hoverScale = 1.06f
+
+        if (hover == 1) {
+            targetHide.animate().scaleX(hoverScale).scaleY(hoverScale).setDuration(120).start()
+            targetHide.background = createCardBg(
+                Color.argb(245, 26, 44, 60),
+                Color.rgb(0, 229, 255),
+                radius,
+                2f
+            )
+        } else {
+            targetHide.animate().scaleX(1.0f).scaleY(1.0f).setDuration(120).start()
+            targetHide.background = createCardBg(
+                Color.argb(235, 24, 24, 34),
+                Color.argb(160, 90, 90, 130),
+                radius,
+                1.2f
+            )
+        }
+
+        if (hover == 2) {
+            targetStop.animate().scaleX(hoverScale).scaleY(hoverScale).setDuration(120).start()
+            targetStop.background = createCardBg(
+                Color.argb(245, 180, 24, 36),
+                Color.rgb(255, 48, 72),
+                radius,
+                2f
+            )
+        } else {
+            targetStop.animate().scaleX(1.0f).scaleY(1.0f).setDuration(120).start()
+            targetStop.background = createCardBg(
+                Color.argb(235, 38, 20, 26),
+                Color.argb(180, 210, 40, 60),
+                radius,
+                1.2f
+            )
+        }
+    }
+
+    private fun dp(value: Int) = (value * resources.displayMetrics.density + 0.5f).toInt()
+}
+

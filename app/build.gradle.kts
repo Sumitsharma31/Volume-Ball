@@ -32,3 +32,9 @@ android {
         jvmTarget = "17"
     }
 }
+
+dependencies {
+    // Official Google Mobile Ads SDK (stable, supports minSdk 23)
+    implementation("com.google.android.gms:play-services-ads:23.6.0")
+}
+
